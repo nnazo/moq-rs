@@ -102,4 +102,9 @@ impl Writer {
     pub fn reset(&mut self, code: u32) {
         self.stream.reset(code);
     }
+
+    /// Wait for the peer to stop the send half of this request stream.
+    pub async fn stopped(&mut self) -> Result<Option<u8>, SessionError> {
+        Ok(self.stream.closed().await?)
+    }
 }

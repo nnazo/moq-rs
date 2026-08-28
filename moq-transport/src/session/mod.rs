@@ -52,6 +52,8 @@ use crate::message::Message;
 use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
+
+pub(super) const CANCELLED_STREAM_CODE: u32 = 0x1;
 use std::path::PathBuf;
 
 /// Registry mapping bidi-request IDs to a channel for forwarding responses.
@@ -953,6 +955,23 @@ impl Session {
                 }
             };
 
+        // PUBLISH_NAMESPACE ends when either endpoint cancels its request stream.
+        if let Message::PublishNamespace(msg) = msg {
+            if let Some(ref mlog) = mlog {
+                if let Ok(mut mlog) = mlog.lock() {
+                    let time = mlog.elapsed_ms();
+                    let _ = mlog.add_event(mlog::events::publish_namespace_parsed(time, 0, &msg));
+                }
+            }
+
+            request_id.validate_incoming(msg.id)?;
+            let recv = subscriber
+                .as_mut()
+                .ok_or(SessionError::RoleViolation)?
+                .recv_publish_namespace(&msg)?;
+            return recv.run(writer, reader, mlog).await;
+        }
+
         // SUBSCRIBE_NAMESPACE owns its stream for the whole life of the request:
         // the reply is not one terminal message but an open-ended NAMESPACE /
         // NAMESPACE_DONE feed. Hand both halves straight to the publisher-side
@@ -1198,11 +1217,7 @@ impl Session {
                 },
             };
 
-            if let Err(err) = dispatched {
-                // Session::run decides: a protocol violation closes the session,
-                // anything else only ends this request.
-                return Err(err);
-            }
+            dispatched?;
 
             if terminal {
                 return Ok(());
@@ -1574,6 +1589,16 @@ pub(crate) mod test_support {
     /// build one. The accepted server side is parked for the lifetime of the test
     /// to keep the client session established.
     pub(crate) async fn loopback_session() -> web_transport::Session {
+        let (client, server) = loopback_session_pair().await;
+        tokio::spawn(async move {
+            let _server = server;
+            std::future::pending::<()>().await;
+        });
+        client
+    }
+
+    pub(crate) async fn loopback_session_pair() -> (web_transport::Session, web_transport::Session)
+    {
         use web_transport::quinn::{ClientBuilder, ServerBuilder};
 
         // Under `cargo test --workspace`, feature unification links both the
@@ -1596,13 +1621,11 @@ pub(crate) mod test_support {
             .expect("build loopback server");
         let addr = server.local_addr().expect("server local addr");
 
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             if let Some(request) = server.accept().await {
-                // Hold the accepted server session open for the lifetime of the
-                // test so the client side stays established; the spawned task is
-                // cancelled at runtime shutdown when the test returns.
-                if let Ok(_session) = request.ok().await {
-                    std::future::pending::<()>().await;
+                if let Ok(session) = request.ok().await {
+                    let _ = accepted_tx.send(session);
                 }
             }
         });
@@ -1615,11 +1638,16 @@ pub(crate) mod test_support {
             .expect("parse loopback url");
 
         // Fail fast rather than hang CI if the loopback handshake ever stalls.
-        tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(url))
+        let client = tokio::time::timeout(std::time::Duration::from_secs(10), client.connect(url))
             .await
             .expect("loopback connect timed out")
-            .expect("connect loopback session")
-            .into()
+            .expect("connect loopback session");
+        let server = tokio::time::timeout(std::time::Duration::from_secs(10), accepted_rx)
+            .await
+            .expect("loopback accept timed out")
+            .expect("accept loopback session");
+
+        (client.into(), server.into())
     }
 }
 
